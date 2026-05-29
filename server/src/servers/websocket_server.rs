@@ -2,7 +2,7 @@ use crate::{
     listeners::order_book::{
         InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
     },
-    order_book::{Coin, Snapshot},
+    order_book::{Coin, Snapshot, types::Side},
     prelude::*,
     types::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
@@ -276,24 +276,31 @@ async fn send_ws_data_from_snapshot(
 }
 
 fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
-    let mut fills = batch.clone().events();
-    let mut trades = HashMap::new();
-    while fills.len() >= 2 {
-        let f2 = fills.pop();
-        let f1 = fills.pop();
-        if let Some(f1) = f1 {
-            if let Some(f2) = f2 {
-                let mut fills = HashMap::new();
-                fills.insert(f1.1.side, f1);
-                fills.insert(f2.1.side, f2);
-                let trade = Trade::from_fills(fills);
+    // A single matched trade is represented by two fill records (one Ask, one
+    // Bid) that share the same trade id (`tid`). Group fills by tid rather than
+    // assuming they arrive as adjacent ask/bid pairs in the batch: when a taker
+    // order crosses multiple resting orders the fills are not necessarily
+    // ordered that way, and pairing two same-side fills previously collapsed the
+    // side-keyed map to a single entry and panicked on the missing side.
+    let mut groups: HashMap<u64, HashMap<Side, NodeDataFill>> = HashMap::new();
+    let mut tid_order: Vec<u64> = Vec::new();
+    for fill in batch.clone().events() {
+        let tid = fill.1.tid;
+        let group = groups.entry(tid).or_insert_with(|| {
+            tid_order.push(tid);
+            HashMap::new()
+        });
+        group.insert(fill.1.side, fill);
+    }
+
+    let mut trades: HashMap<String, Vec<Trade>> = HashMap::new();
+    for tid in tid_order {
+        if let Some(group) = groups.remove(&tid) {
+            if let Some(trade) = Trade::from_fills(group) {
                 let coin = trade.coin.clone();
                 trades.entry(coin).or_insert_with(Vec::new).push(trade);
             }
         }
-    }
-    for list in trades.values_mut() {
-        list.reverse();
     }
     trades
 }

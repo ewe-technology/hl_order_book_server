@@ -57,22 +57,24 @@ impl L2Book {
 }
 
 impl Trade {
-    #[allow(clippy::unwrap_used)]
-    pub(crate) fn from_fills(mut fills: HashMap<Side, NodeDataFill>) -> Self {
-        let NodeDataFill(seller, ask_fill) = fills.remove(&Side::Ask).unwrap();
-        let NodeDataFill(buyer, bid_fill) = fills.remove(&Side::Bid).unwrap();
+    /// Builds a `Trade` from the two fill records (one per side) that make up a
+    /// matched trade. Returns `None` if both sides are not present, so a
+    /// malformed group can be skipped instead of crashing the worker.
+    pub(crate) fn from_fills(mut fills: HashMap<Side, NodeDataFill>) -> Option<Self> {
+        let NodeDataFill(seller, ask_fill) = fills.remove(&Side::Ask)?;
+        let NodeDataFill(buyer, bid_fill) = fills.remove(&Side::Bid)?;
         let ask_is_taker = ask_fill.crossed;
         let side = if ask_is_taker { Side::Ask } else { Side::Bid };
         let coin = ask_fill.coin.clone();
-        assert_eq!(coin, bid_fill.coin);
+        debug_assert_eq!(coin, bid_fill.coin);
         let tid = ask_fill.tid;
-        assert_eq!(tid, bid_fill.tid);
+        debug_assert_eq!(tid, bid_fill.tid);
         let px = ask_fill.px;
         let sz = ask_fill.sz;
         let hash = ask_fill.hash;
         let time = ask_fill.time;
         let users = [buyer, seller];
-        Self { coin, side, px, sz, hash, time, tid, users }
+        Some(Self { coin, side, px, sz, hash, time, tid, users })
     }
 }
 
