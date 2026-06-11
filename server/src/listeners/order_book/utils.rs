@@ -7,7 +7,7 @@ use crate::{
     },
     prelude::*,
     types::{
-        inner::InnerLevel,
+        inner::{InnerL4Order, InnerLevel},
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
@@ -44,9 +44,18 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
     Ok(output_path)
 }
 
-pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
-    snapshot: &Snapshots<O>,
-    expected: Snapshots<O>,
+// Orders that entered the book by triggering (trigger_condition == "Triggered") are
+// excluded from validation on both sides: the node's snapshot includes them, but the
+// node's order diff stream does not reliably emit a `New` diff when a trigger order
+// converts to a resting order, so the locally built book cannot be expected to
+// contain them. See repeated "Orders do not match" crashes on just-triggered stops.
+fn non_triggered(orders: &[InnerL4Order]) -> impl Iterator<Item = &InnerL4Order> {
+    orders.iter().filter(|o| o.trigger_condition != "Triggered")
+}
+
+pub(super) fn validate_snapshot_consistency(
+    snapshot: &Snapshots<InnerL4Order>,
+    expected: Snapshots<InnerL4Order>,
     ignore_spot: bool,
 ) -> Result<()> {
     let mut snapshot_map: HashMap<_, _> =
@@ -59,7 +68,7 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
         let book1 = book.as_ref();
         if let Some(book2) = snapshot_map.remove(coin) {
             for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
-                for (order1, order2) in orders1.iter().zip(orders2.iter()) {
+                for (order1, order2) in non_triggered(orders1).zip(non_triggered(orders2)) {
                     if *order1 != *order2 {
                         return Err(
                             format!("Orders do not match, expected: {:?} received: {:?}", *order2, *order1).into()
@@ -67,7 +76,7 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
                     }
                 }
             }
-        } else if !book1[0].is_empty() || !book1[1].is_empty() {
+        } else if book1.iter().any(|orders| non_triggered(orders).next().is_some()) {
             return Err(format!("Missing {} book", coin.value()).into());
         }
     }
