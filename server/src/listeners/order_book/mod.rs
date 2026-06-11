@@ -14,7 +14,7 @@ use crate::{
 };
 use alloy::primitives::Address;
 use fs::File;
-use log::{error, info};
+use log::{error, info, warn};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     cmp::Ordering,
@@ -112,6 +112,9 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                         return Err("Snapshot fetch task sender dropped".into());
                     }
                     Some(Err(err)) => {
+                        // Only state-consistency failures (validation mismatch, lagging
+                        // snapshot, missing cached updates) reach here; transient fetch
+                        // errors are logged and retried inside fetch_snapshot.
                         return Err(format!("Abci state reading error: {err}").into());
                     }
                     Some(Ok(())) => {}
@@ -140,51 +143,71 @@ fn fetch_snapshot(
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
-        let res = match process_rmp_file(&dir).await {
-            Ok(output_fln) => {
-                let state = {
-                    let mut listener = listener.lock().await;
-                    listener.begin_caching();
-                    listener.clone_state()
-                };
-                let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
-                info!("Snapshot fetched");
-                // sleep to let some updates build up.
-                sleep(Duration::from_secs(1)).await;
-                let mut cache = {
-                    let mut listener = listener.lock().await;
-                    listener.take_cache()
-                };
-                info!("Cache has {} elements", cache.len());
-                match snapshot {
-                    Ok((height, expected_snapshot)) => {
-                        if let Some(mut state) = state {
-                            while state.height() < height {
-                                if let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                                    state.apply_updates(order_statuses, order_diffs)?;
-                                } else {
-                                    return Err::<(), Error>("Not enough cached updates".into());
-                                }
-                            }
-                            if state.height() > height {
-                                return Err("Fetched snapshot lagging stored state".into());
-                            }
-                            let stored_snapshot = state.compute_snapshot().snapshot;
-                            info!("Validating snapshot");
-                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
-                        } else {
-                            listener.lock().await.init_from_snapshot(expected_snapshot, height);
-                            Ok(())
-                        }
-                    }
-                    Err(err) => Err(err),
-                }
-            }
-            Err(err) => Err(err),
-        };
+        // All outcomes (including consistency errors) must flow through tx so the
+        // main loop sees them. Transient fetch failures are downgraded to Ok(())
+        // inside fetch_and_validate_snapshot and simply retried on the next tick.
+        let res = fetch_and_validate_snapshot(dir, listener, ignore_spot).await;
         let _unused = tx.send(res);
-        Ok(())
     });
+}
+
+async fn fetch_and_validate_snapshot(
+    dir: PathBuf,
+    listener: Arc<Mutex<OrderBookListener>>,
+    ignore_spot: bool,
+) -> Result<()> {
+    let output_fln = match process_rmp_file(&dir).await {
+        Ok(output_fln) => output_fln,
+        Err(err) => {
+            // Could not get a snapshot out of the node (e.g. it is not yet listening
+            // on localhost:3001). Transient: retry on the next tick.
+            warn!(
+                "Abci state snapshot fetch failed (is {HL_NODE} running and serving on localhost:3001?), will retry next tick: {err}"
+            );
+            return Ok(());
+        }
+    };
+    let state = {
+        let mut listener = listener.lock().await;
+        listener.begin_caching();
+        listener.clone_state()
+    };
+    let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
+    info!("Snapshot fetched");
+    // sleep to let some updates build up.
+    sleep(Duration::from_secs(1)).await;
+    let mut cache = {
+        let mut listener = listener.lock().await;
+        listener.take_cache()
+    };
+    info!("Cache has {} elements", cache.len());
+    let (height, expected_snapshot) = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            // Snapshot file failed to load/parse (e.g. node still writing it).
+            // Transient: skip this validation cycle and retry on the next tick.
+            warn!("Failed to load fetched snapshot (will retry next tick): {err}");
+            return Ok(());
+        }
+    };
+    if let Some(mut state) = state {
+        while state.height() < height {
+            if let Some((order_statuses, order_diffs)) = cache.pop_front() {
+                state.apply_updates(order_statuses, order_diffs)?;
+            } else {
+                return Err("Not enough cached updates".into());
+            }
+        }
+        if state.height() > height {
+            return Err("Fetched snapshot lagging stored state".into());
+        }
+        let stored_snapshot = state.compute_snapshot().snapshot;
+        info!("Validating snapshot");
+        validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
+    } else {
+        listener.lock().await.init_from_snapshot(expected_snapshot, height);
+        Ok(())
+    }
 }
 
 pub(crate) struct OrderBookListener {
